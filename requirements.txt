@@ -1,5 +1,5 @@
-streamlit==1.32.2
-torch==2.2.2
-transformers==4.38.2
+streamlit==1.36.0
+torch==2.5.1
+transformers==4.44.2
 numpy==1.26.4
-pillow==10.2.0
+pillow==10.4.0

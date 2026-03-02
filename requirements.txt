@@ -1,5 +1,6 @@
 streamlit==1.36.0
 torch==2.5.1
-transformers==4.44.2
+transformers==4.45.2
+tokenizers==0.20.3
 numpy==1.26.4
 pillow==10.4.0

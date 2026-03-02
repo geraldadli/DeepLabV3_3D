@@ -45,7 +45,7 @@ except Exception:
 
 # ---------------- CONFIG ----------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_PATH = "output/model_epoch6.pth"     # adjust if different
+MODEL_PATH = "best_model_simpledinov2.pth"       # adjust if different
 BACKBONE = "facebook/dinov2-small"
 IMAGE_SIZE = 128                           # model input spatial size
 NUM_CLASSES = 2

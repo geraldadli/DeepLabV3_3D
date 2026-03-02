@@ -1,4 +1,4 @@
-# app.py
+# app.py (robust GeoTIFF reader fallback + full app)
 import io
 from pathlib import Path
 import numpy as np
@@ -10,13 +10,23 @@ import torch.nn as nn
 # transformers (Dinov2 + processor)
 from transformers import Dinov2Model, AutoImageProcessor
 
-# rasterio for GeoTIFF handling (optional but strongly recommended)
+# Try optional TIFF libraries in a safe order
 try:
     import rasterio
     from rasterio.io import MemoryFile
 except Exception:
     rasterio = None
     MemoryFile = None
+
+try:
+    import tifffile
+except Exception:
+    tifffile = None
+
+try:
+    import imageio.v3 as iio
+except Exception:
+    iio = None
 
 # ---------------- CONFIG ----------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -133,64 +143,119 @@ except Exception as e:
     st.sidebar.error(str(e))
     st.stop()
 
-# ---------------- Robust file reader ----------------
+# ---------------- Robust file reader (TIFF fallback chain) ----------------
 def read_uploaded_image(uploaded_file, image_size=IMAGE_SIZE):
     """
-    Robust satellite reader:
-    - Uses rasterio for ALL tif
-    - Uses PIL only for jpg/png
-    - Handles multi-band Sentinel data
+    Return (pil_rgb_resized, tif_profile_or_None)
+
+    Strategy:
+      - If filename ends with .tif/.tiff: try rasterio -> tifffile -> imageio
+      - Else try PIL for jpg/png
+      - If no reader available, raise a helpful RuntimeError
     """
+    if uploaded_file is None:
+        raise RuntimeError("No file provided.")
+    filename = getattr(uploaded_file, "name", "")
+    raw = uploaded_file.read()
+    if raw is None or len(raw) == 0:
+        raise RuntimeError("Empty upload or failed to read file.")
 
-    filename = uploaded_file.name.lower()
-    file_bytes = uploaded_file.read()
+    lower = filename.lower()
 
-    # ---------- GEO-TIFF (Satellite Safe) ----------
-    if filename.endswith((".tif", ".tiff")):
+    # ---------- GEO-TIFF branch ----------
+    if lower.endswith((".tif", ".tiff")):
+        # 1) rasterio (preferred)
+        if rasterio is not None and MemoryFile is not None:
+            try:
+                with MemoryFile(raw) as mem:
+                    with mem.open() as src:
+                        data = src.read(out_dtype="float32")  # (bands, H, W)
+                        profile = src.profile.copy()
+                        # keep first 3 bands or replicate
+                        if data.shape[0] >= 3:
+                            rgb = data[:3]
+                        else:
+                            reps = int(np.ceil(3.0 / max(1, data.shape[0])))
+                            rgb = np.tile(data, (reps, 1, 1))[:3]
+                        # robust percentile stretch to avoid extreme outliers
+                        p2 = np.nanpercentile(rgb, 2)
+                        p98 = np.nanpercentile(rgb, 98)
+                        rgb = np.clip((rgb - p2) / (p98 - p2 + 1e-9), 0, 1)
+                        rgb = np.moveaxis(rgb, 0, -1)  # H,W,3
+                        pil = Image.fromarray((rgb * 255).astype(np.uint8))
+                        pil = pil.convert("RGB")
+                        pil = pil.resize((image_size, image_size), resample=Image.BILINEAR)
+                        return pil, profile
+            except Exception as e:
+                # fall through to other readers but keep note
+                last_err = f"rasterio failed: {e}"
+        else:
+            last_err = "rasterio not installed"
 
-        if rasterio is None:
-            raise RuntimeError("TIFF uploaded but rasterio is not installed")
+        # 2) tifffile (python wheel often available)
+        if tifffile is not None:
+            try:
+                arr = tifffile.imread(io.BytesIO(raw))
+                # tifffile may return H,W or H,W,C or C,H,W
+                arr = np.asarray(arr)
+                if arr.ndim == 2:
+                    # single band -> replicate
+                    arr = np.stack([arr, arr, arr], axis=-1)
+                elif arr.ndim == 3 and arr.shape[0] <= 4 and arr.shape[0] != arr.shape[2]:
+                    # likely (bands, H, W) -> transpose
+                    if arr.shape[0] <= 4 and arr.shape[0] != arr.shape[2]:
+                        arr = np.moveaxis(arr, 0, -1)  # bands,H,W -> H,W,bands
+                # now arr is H,W,C
+                # normalize by percentiles
+                p2 = np.nanpercentile(arr, 2)
+                p98 = np.nanpercentile(arr, 98)
+                rgb = np.clip((arr - p2) / (p98 - p2 + 1e-9), 0, 1)
+                if rgb.shape[2] > 3:
+                    rgb = rgb[:, :, :3]
+                elif rgb.shape[2] < 3:
+                    # replicate channels
+                    rgb = np.repeat(rgb, 3, axis=2)[:, :, :3]
+                pil = Image.fromarray((rgb * 255).astype(np.uint8))
+                pil = pil.convert("RGB")
+                pil = pil.resize((image_size, image_size), resample=Image.BILINEAR)
+                return pil, None
+            except Exception as e:
+                last_err = (last_err + "; tifffile failed: " + str(e)) if 'last_err' in locals() else f"tifffile failed: {e}"
 
-        try:
-            with MemoryFile(file_bytes) as mem:
-                with mem.open() as src:
-                    data = src.read()  # (bands, H, W)
-                    profile = src.profile
+        # 3) imageio (final fallback)
+        if iio is not None:
+            try:
+                arr = iio.imread(io.BytesIO(raw))
+                arr = np.asarray(arr)
+                if arr.ndim == 2:
+                    arr = np.stack([arr, arr, arr], axis=-1)
+                if arr.ndim == 3 and arr.shape[2] > 3:
+                    arr = arr[:, :, :3]
+                # normalize
+                p2 = np.nanpercentile(arr, 2)
+                p98 = np.nanpercentile(arr, 98)
+                rgb = np.clip((arr - p2) / (p98 - p2 + 1e-9), 0, 1)
+                pil = Image.fromarray((rgb * 255).astype(np.uint8))
+                pil = pil.convert("RGB")
+                pil = pil.resize((image_size, image_size), resample=Image.BILINEAR)
+                return pil, None
+            except Exception as e:
+                last_err = (last_err + "; imageio failed: " + str(e)) if 'last_err' in locals() else f"imageio failed: {e}"
 
-                    # --- Convert to RGB ---
-                    if data.shape[0] >= 3:
-                        rgb = data[:3]  # first 3 bands
-                    else:
-                        # replicate if less bands
-                        rgb = np.repeat(data, 3, axis=0)[:3]
+        # If we reach here, no TIFF reader succeeded
+        hint = "Install 'rasterio' or 'tifffile' in requirements.txt on Streamlit Cloud and redeploy."
+        raise RuntimeError(f"Unable to read TIFF on server. {hint} Details: {last_err if 'last_err' in locals() else 'no reader available.'}")
 
-                    # Normalize safely
-                    rgb = rgb.astype("float32")
-
-                    # robust min-max per image
-                    min_val = np.nanpercentile(rgb, 2)
-                    max_val = np.nanpercentile(rgb, 98)
-
-                    rgb = np.clip((rgb - min_val) / (max_val - min_val + 1e-6), 0, 1)
-
-                    rgb = np.moveaxis(rgb, 0, -1)  # HWC
-
-                    pil = Image.fromarray((rgb * 255).astype(np.uint8))
-                    pil = pil.resize((image_size, image_size))
-
-                    return pil, profile
-
-        except Exception as e:
-            raise RuntimeError(f"Failed reading GeoTIFF: {e}")
-
-    # ---------- JPG / PNG ----------
+    # ---------- non-tiff files (JPEG/PNG etc) ----------
     else:
         try:
-            image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-            image = image.resize((image_size, image_size))
-            return image, None
+            pil = Image.open(io.BytesIO(raw)).convert("RGB")
+            pil = pil.resize((image_size, image_size), resample=Image.BILINEAR)
+            return pil, None
+        except UnidentifiedImageError as e:
+            raise RuntimeError("Uploaded file is not a recognized image format (PIL). If you uploaded a GeoTIFF, install 'rasterio' or 'tifffile' as noted.")
         except Exception as e:
-            raise RuntimeError(f"Invalid image file: {e}")
+            raise RuntimeError(f"Failed to open uploaded image: {e}")
 
 # ---------------- Preprocess helper ----------------
 def pil_to_input_tensor(pil: Image.Image, proc):

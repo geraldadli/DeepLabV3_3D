@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.ipynb_checkpoints
+output/
+*.pth  # remove if you will commit model; otherwise allow only if using LFS

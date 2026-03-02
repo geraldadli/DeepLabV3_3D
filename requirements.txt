@@ -1,0 +1,7 @@
+streamlit==1.26.0
+torch    # leave version open if you built model on specific torch; add e.g. torch==2.1.0+cu117 if needed
+transformers>=4.30.0
+rasterio
+pillow
+numpy
+matplotlib

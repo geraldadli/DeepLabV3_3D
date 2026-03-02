@@ -351,14 +351,19 @@ else:
         st.download_button("Download mask (PNG)", data=buf.getvalue(), file_name="pred_mask.png", mime="image/png")
 
         # GeoTIFF export (if original profile present and rasterio available)
+        # --------- Alternative: use a uint8 nodata (Option B) ----------
         if tif_profile is not None and rasterio is not None:
             try:
-                # build output array as uint8 0/255 and scale back to original dims if profile available
+                # use 0 or 255 as the nodata for uint8
+                chosen_nodata = 255
+
                 out_mask = (pred.astype(np.uint8) * 255)
+                # optionally set original background to chosen_nodata if needed:
+                # out_mask[background_condition] = chosen_nodata
+
                 orig_h = tif_profile.get("height", None)
                 orig_w = tif_profile.get("width", None)
                 if orig_h and orig_w and (orig_h != out_mask.shape[0] or orig_w != out_mask.shape[1]):
-                    # resize back using nearest neighbor
                     pil_mask = Image.fromarray(out_mask)
                     pil_mask = pil_mask.resize((orig_w, orig_h), resample=Image.NEAREST)
                     out_arr = np.array(pil_mask).astype(np.uint8)
@@ -366,13 +371,14 @@ else:
                     out_arr = out_mask.astype(np.uint8)
 
                 out_profile = tif_profile.copy()
-                out_profile.update(dtype=rasterio.uint8, count=1, compress="lzw")
+                out_profile.update({"dtype": "uint8", "count": 1, "compress": "lzw", "nodata": int(chosen_nodata)})
 
                 tmp_path = "pred_mask_georef.tif"
                 with rasterio.open(tmp_path, "w", **out_profile) as dst:
-                    dst.write(out_arr[np.newaxis, :, :].astype(rasterio.uint8))
+                    dst.write(out_arr[np.newaxis, :, :])
                 with open(tmp_path, "rb") as f:
                     st.download_button("Download mask (GeoTIFF)", data=f.read(), file_name="pred_mask_georef.tif", mime="image/tiff")
+
             except Exception as e:
                 st.warning(f"GeoTIFF export failed: {e}")
                 st.exception(e)

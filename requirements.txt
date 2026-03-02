@@ -6,3 +6,5 @@ numpy
 pillow
 rasterio
 tifffile
+matplotlib
+scikit-learn

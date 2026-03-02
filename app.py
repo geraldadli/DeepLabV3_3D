@@ -136,59 +136,61 @@ except Exception as e:
 # ---------------- Robust file reader ----------------
 def read_uploaded_image(uploaded_file, image_size=IMAGE_SIZE):
     """
-    Return (pil_rgb_resized, rasterio_profile_or_None)
-    Raises RuntimeError on failure with a helpful message.
+    Robust satellite reader:
+    - Uses rasterio for ALL tif
+    - Uses PIL only for jpg/png
+    - Handles multi-band Sentinel data
     """
-    if uploaded_file is None:
-        raise RuntimeError("No file provided.")
 
-    filename = getattr(uploaded_file, "name", "")
-    raw = uploaded_file.read()
-    if raw is None or len(raw) == 0:
-        raise RuntimeError("Empty file or failed to read upload.")
+    filename = uploaded_file.name.lower()
+    file_bytes = uploaded_file.read()
 
-    lower = filename.lower()
+    # ---------- GEO-TIFF (Satellite Safe) ----------
+    if filename.endswith((".tif", ".tiff")):
 
-    # Prefer rasterio for .tif/.tiff
-    if lower.endswith((".tif", ".tiff")) and rasterio is not None and MemoryFile is not None:
+        if rasterio is None:
+            raise RuntimeError("TIFF uploaded but rasterio is not installed")
+
         try:
-            with MemoryFile(raw) as mem:
+            with MemoryFile(file_bytes) as mem:
                 with mem.open() as src:
-                    arr = src.read(out_dtype="float32")  # (C,H,W)
-                    profile = src.profile.copy()
-                    # take up to 3 bands (replicate if fewer)
-                    if arr.shape[0] >= 3:
-                        img_arr = arr[:3]
-                    else:
-                        reps = int(np.ceil(3.0 / max(1, arr.shape[0])))
-                        stacked = np.tile(arr, (reps, 1, 1))
-                        img_arr = stacked[:3]
-                    # per-image min-max normalize
-                    mn = img_arr.min()
-                    mx = img_arr.max()
-                    if mx - mn < 1e-8:
-                        img_hwc = np.moveaxis(np.clip(img_arr, 0, 1), 0, -1).astype("float32")
-                    else:
-                        img_hwc = np.moveaxis((img_arr - mn) / (mx - mn + 1e-6), 0, -1).astype("float32")
-                    pil = Image.fromarray((np.clip(img_hwc, 0, 1) * 255).astype("uint8"))
-                    pil = pil.convert("RGB")
-                    pil = pil.resize((image_size, image_size), resample=Image.BILINEAR)
-                    return pil, profile
-        except Exception as e:
-            raise RuntimeError(f"Failed reading TIFF with rasterio: {e}")
+                    data = src.read()  # (bands, H, W)
+                    profile = src.profile
 
-    # Otherwise try PIL for common formats
-    try:
-        bio = io.BytesIO(raw)
-        pil = Image.open(bio)
-        pil = pil.convert("RGB")
-        pil = pil.resize((image_size, image_size), resample=Image.BILINEAR)
-        return pil, None
-    except UnidentifiedImageError as e:
-        raise RuntimeError("Uploaded file is not a recognized image format. If you uploaded a GeoTIFF, ensure it's valid .tif/.tiff. "
-                           f"Original error: {e}")
-    except Exception as e:
-        raise RuntimeError(f"Failed to open uploaded file: {e}")
+                    # --- Convert to RGB ---
+                    if data.shape[0] >= 3:
+                        rgb = data[:3]  # first 3 bands
+                    else:
+                        # replicate if less bands
+                        rgb = np.repeat(data, 3, axis=0)[:3]
+
+                    # Normalize safely
+                    rgb = rgb.astype("float32")
+
+                    # robust min-max per image
+                    min_val = np.nanpercentile(rgb, 2)
+                    max_val = np.nanpercentile(rgb, 98)
+
+                    rgb = np.clip((rgb - min_val) / (max_val - min_val + 1e-6), 0, 1)
+
+                    rgb = np.moveaxis(rgb, 0, -1)  # HWC
+
+                    pil = Image.fromarray((rgb * 255).astype(np.uint8))
+                    pil = pil.resize((image_size, image_size))
+
+                    return pil, profile
+
+        except Exception as e:
+            raise RuntimeError(f"Failed reading GeoTIFF: {e}")
+
+    # ---------- JPG / PNG ----------
+    else:
+        try:
+            image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+            image = image.resize((image_size, image_size))
+            return image, None
+        except Exception as e:
+            raise RuntimeError(f"Invalid image file: {e}")
 
 # ---------------- Preprocess helper ----------------
 def pil_to_input_tensor(pil: Image.Image, proc):
